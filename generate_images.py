@@ -90,9 +90,10 @@ def load_quantized_model(model_args, training_args, w_bits=16):
 
     return model
 
-def generate_images(pipe, prompt, num_images, output_dir, device, seed):
+def generate_images(pipe, prompt, output_dir, device, seed):
+    output_dir.mkdir(parents=True, exist_ok=True)
     generator = torch.manual_seed(seed)
-    images = pipe(prompt, num_images=num_images, generator=generator).images
+    images = pipe(prompt, generator=generator).images
     for i, img in enumerate(images):
         img.save(output_dir / f"image_{i}.png")
 
@@ -104,8 +105,8 @@ def main(prompt):
     count_parameters(pipe.transformer)
 
     samples_dir = Path("output") / "samples" / "bf16"
-    generate_images(pipe, prompt, 2, samples_dir / "try1", 'cuda', seed=42)
-    generate_images(pipe, prompt, 2, samples_dir / "try2", 'cuda', seed=42)
+    generate_images(pipe, prompt, samples_dir / "try1", 'cuda', seed=42)
+    generate_images(pipe, prompt, samples_dir / "try2", 'cuda', seed=42)
     print(f"Samples saved to '{samples_dir}'")
     
     del pipe.transformer

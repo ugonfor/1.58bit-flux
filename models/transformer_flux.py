@@ -42,8 +42,8 @@ from diffusers.models.normalization import AdaLayerNormContinuous #, AdaLayerNor
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 ############################################# Flux Model Quantization ####################################
-# from .utils_quant import QuantizeLinear
-from .utils_quant import LoRAQuantizeLinear as QuantizeLinear
+from .utils_quant import QuantizeLinear
+# from .utils_quant import LoRAQuantizeLinear as QuantizeLinear
 ##########################################################################################################
 
 
