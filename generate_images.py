@@ -47,8 +47,33 @@ def count_parameters(model):
         "quantize_linear_ratio": quantize_linear_ratio
     }
 
-def load_quantized_model(model_name, w_bits=16):
+import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor
+import torch.multiprocessing as torch_mp
 
+def calculate_scale_and_zero_point(args):
+    """병렬 처리를 위한 헬퍼 함수"""
+    name, weight_param, w_bits = args
+    
+    # Calculate scale
+    xmax, _ = torch.max(torch.abs(weight_param), dim=-1, keepdim=True)
+    maxq = 2 ** (w_bits - 1) - 1
+    scale = xmax / maxq
+    
+    # Calculate zero_point
+    zero_point_name = name.replace("weight_scale", "weight_zero_point")
+    xmin, _ = torch.min(weight_param, dim=-1, keepdim=True)
+    xmax, _ = torch.max(weight_param, dim=-1, keepdim=True)
+    qmin = 0
+    qmax = 2 ** w_bits - 1
+    
+    # Calculate zero point: zero_point = qmin - round(xmin / scale)
+    zero_point = qmin - torch.round(xmin / scale)
+    zero_point = torch.clamp(zero_point, qmin, qmax)
+    
+    return name, scale, zero_point_name, zero_point
+
+def load_quantized_model(model_name, w_bits=16):
     model = FluxTransformer2DModelQuant.from_pretrained(
         pretrained_model_name_or_path=model_name,
         subfolder="transformer",
@@ -59,34 +84,36 @@ def load_quantized_model(model_name, w_bits=16):
     )
 
     weight_scale_dict = {}
-    for name, param in tqdm(model.named_parameters(), desc="Initializing weight_scale and weight_zero_point"):
-        if "weight_scale" in name:
-            weight_name = name.replace("weight_scale", "weight")
-            weight_param = dict(model.named_parameters()).get(weight_name, None)
-
-            if w_bits <= 8:
-                # Calculate scale
-                xmax, _ = torch.max(torch.abs(weight_param), dim=-1, keepdim=True)
-                maxq = 2 ** (w_bits - 1) - 1
-                scale = xmax / maxq
-                weight_scale_dict[name] = scale
-                
-                # Calculate zero_point
-                zero_point_name = name.replace("weight_scale", "weight_zero_point")
-                xmin, _ = torch.min(weight_param, dim=-1, keepdim=True)
-                xmax, _ = torch.max(weight_param, dim=-1, keepdim=True)
-                qmin = 0
-                qmax = 2 ** w_bits - 1
-                
-                # Calculate zero point: zero_point = qmin - round(xmin / scale)
-                zero_point = qmin - torch.round(xmin / scale)
-                zero_point = torch.clamp(zero_point, qmin, qmax)
-                weight_scale_dict[zero_point_name] = zero_point
-            else:
-                raise NotImplementedError
+    
+    if w_bits <= 8:
+        # 병렬 처리를 위한 데이터 준비
+        scale_tasks = []
+        named_params = dict(model.named_parameters())
+        
+        for name, param in named_params.items():
+            if "weight_scale" in name:
+                weight_name = name.replace("weight_scale", "weight")
+                weight_param = named_params.get(weight_name, None)
+                if weight_param is not None:
+                    scale_tasks.append((name, weight_param, w_bits))
+        
+        # ThreadPoolExecutor 사용 (GPU 메모리 공유를 위해)
+        with ThreadPoolExecutor(max_workers=min(len(scale_tasks), mp.cpu_count())) as executor:
+            results = list(tqdm(
+                executor.map(calculate_scale_and_zero_point, scale_tasks),
+                total=len(scale_tasks),
+                desc="Calculating scales and zero points"
+            ))
+        
+        # 결과를 dictionary에 저장
+        for scale_name, scale, zero_point_name, zero_point in results:
+            weight_scale_dict[scale_name] = scale
+            weight_scale_dict[zero_point_name] = zero_point
+            
+    else:
+        raise NotImplementedError
 
     model.load_state_dict(weight_scale_dict, assign=True, strict=False)
-
     return model
 
 def generate_images(pipe, prompt, output_dir, device, seed):
