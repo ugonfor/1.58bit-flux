@@ -47,13 +47,12 @@ def count_parameters(model):
         "quantize_linear_ratio": quantize_linear_ratio
     }
 
-def load_quantized_model(model_args, training_args, w_bits=16):
-    dtype = torch.bfloat16 if training_args.bf16 else torch.float
+def load_quantized_model(model_name, w_bits=16):
 
     model = FluxTransformer2DModelQuant.from_pretrained(
-        pretrained_model_name_or_path=model_args.input_model_filename,
+        pretrained_model_name_or_path=model_name,
         subfolder="transformer",
-        torch_dtype=dtype,
+        torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=False,
         device_map=None,
         w_bits=w_bits
@@ -101,16 +100,28 @@ def main(prompt):
     # Sanity Check Full Precision
     model_name = "black-forest-labs/FLUX.1-dev"
     pipe: FluxPipeline = DiffusionPipeline.from_pretrained(model_name, torch_dtype=torch.bfloat16).to('cuda')
-
     count_parameters(pipe.transformer)
 
-    samples_dir = Path("output") / "samples" / "bf16"
-    generate_images(pipe, prompt, samples_dir / "try1", 'cuda', seed=42)
-    generate_images(pipe, prompt, samples_dir / "try2", 'cuda', seed=42)
-    print(f"Samples saved to '{samples_dir}'")
-    
-    del pipe.transformer
+    samples_dir = Path("output") / "samples"
+    generate_images(pipe, prompt, samples_dir / "bf16", 'cuda', seed=42)
+    print(f"Samples saved to '{samples_dir / 'bf16'}'")
+
     torch.cuda.empty_cache()
+
+
+    for w_bits in [1,2,3,4,8]:
+        # Clear cache before loading new model
+        torch.cuda.empty_cache()
+        
+        # Load new model
+        pipe.transformer = load_quantized_model(model_name, w_bits=w_bits)
+        count_parameters(pipe.transformer)
+        generate_images(pipe, prompt, samples_dir / f"w{w_bits}", 'cuda', seed=42)
+        print(f"Samples saved to '{samples_dir / f'w{w_bits}'}'")
+        
+        # Clean up after each iteration
+        del pipe.transformer
+        torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     main(prompt="A fantasy landscape with mountains and a river")
