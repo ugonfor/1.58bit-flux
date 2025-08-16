@@ -19,9 +19,6 @@ def count_parameters(model):
     quantize_linear_params = 0
 
     for name, module in model.named_modules():
-        if not 'transformer' in name:
-            continue
-            
         # First check for QuantizeLinear specifically
         if isinstance(module, QuantizeLinear):
             quantize_linear_params += sum(p.numel() for p in module.parameters())
