@@ -117,3 +117,6 @@ class QuantizeLinear(nn.Linear):
             out += self.bias.view(1, -1).expand_as(out)
 
         return out
+
+    def extra_repr(self) -> str:
+        return f"w_bits={self.w_bits}, weight_layerwise={self.weight_layerwise}, use_low_rank={self.use_low_rank}, low_rank_dim={self.low_rank_dim}, low_rank_alpha={self.low_rank_alpha}"

@@ -43,7 +43,7 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 ############################################# Flux Model Quantization ####################################
 from .utils_quant import QuantizeLinear
-# from .utils_quant import LoRAQuantizeLinear as QuantizeLinear
+
 ##########################################################################################################
 
 
@@ -95,7 +95,7 @@ class AdaLayerNormZero(nn.Module):
         num_embeddings (`int`): The size of the embeddings dictionary.
     """
 
-    def __init__(self, embedding_dim: int, num_embeddings: Optional[int] = None, norm_type="layer_norm", bias=True, w_bits=0):
+    def __init__(self, embedding_dim: int, num_embeddings: Optional[int] = None, norm_type="layer_norm", bias=True, w_bits=0, use_low_rank: bool = False, low_rank_dim: int = 0, low_rank_alpha: float = 0.0):
         super().__init__()
         if num_embeddings is not None:
             self.emb = CombinedTimestepLabelEmbeddings(num_embeddings, embedding_dim)
@@ -103,7 +103,7 @@ class AdaLayerNormZero(nn.Module):
             self.emb = None
 
         self.silu = nn.SiLU()
-        self.linear = QuantizeLinear(embedding_dim, 6 * embedding_dim, bias=bias, w_bits=w_bits)
+        self.linear = QuantizeLinear(embedding_dim, 6 * embedding_dim, bias=bias, w_bits=w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
         if norm_type == "layer_norm":
             self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
         elif norm_type == "fp32_layer_norm":
@@ -138,11 +138,11 @@ class AdaLayerNormZeroSingle(nn.Module):
         num_embeddings (`int`): The size of the embeddings dictionary.
     """
 
-    def __init__(self, embedding_dim: int, norm_type="layer_norm", bias=True, w_bits=0):
+    def __init__(self, embedding_dim: int, norm_type="layer_norm", bias=True, w_bits=0, use_low_rank: bool = False, low_rank_dim: int = 0, low_rank_alpha: float = 0.0):
         super().__init__()
 
         self.silu = nn.SiLU()
-        self.linear = QuantizeLinear(embedding_dim, 3 * embedding_dim, bias=bias, w_bits=w_bits)
+        self.linear = QuantizeLinear(embedding_dim, 3 * embedding_dim, bias=bias, w_bits=w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
         if norm_type == "layer_norm":
             self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
         else:
@@ -172,9 +172,9 @@ class GELU(nn.Module):
         bias (`bool`, defaults to True): Whether to use a bias in the linear layer.
     """
 
-    def __init__(self, dim_in: int, dim_out: int, approximate: str = "none", bias: bool = True, w_bits=0):
+    def __init__(self, dim_in: int, dim_out: int, approximate: str = "none", bias: bool = True, w_bits=0, use_low_rank: bool = False, low_rank_dim: int = 0, low_rank_alpha: float = 0.0):
         super().__init__()
-        self.proj = QuantizeLinear(dim_in, dim_out, bias=bias, w_bits=w_bits)
+        self.proj = QuantizeLinear(dim_in, dim_out, bias=bias, w_bits=w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
         self.approximate = approximate
 
     def gelu(self, gate: torch.Tensor) -> torch.Tensor:
@@ -277,6 +277,9 @@ class Attention(nn.Module):
         elementwise_affine: bool = True,
         is_causal: bool = False,
         w_bits: int = 0,
+        use_low_rank: bool = False,
+        low_rank_dim: int = 0,
+        low_rank_alpha: float = 0.0,
     ):
         super().__init__()
 
@@ -384,22 +387,22 @@ class Attention(nn.Module):
                 f"unknown cross_attention_norm: {cross_attention_norm}. Should be None, 'layer_norm' or 'group_norm'"
             )
 
-        self.to_q = QuantizeLinear(query_dim, self.inner_dim, bias=bias, w_bits=w_bits)
+        self.to_q = QuantizeLinear(query_dim, self.inner_dim, bias=bias, w_bits=w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
 
         if not self.only_cross_attention:
             # only relevant for the `AddedKVProcessor` classes
-            self.to_k = QuantizeLinear(self.cross_attention_dim, self.inner_kv_dim, bias=bias, w_bits=w_bits)
-            self.to_v = QuantizeLinear(self.cross_attention_dim, self.inner_kv_dim, bias=bias, w_bits=w_bits)
+            self.to_k = QuantizeLinear(self.cross_attention_dim, self.inner_kv_dim, bias=bias, w_bits=w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
+            self.to_v = QuantizeLinear(self.cross_attention_dim, self.inner_kv_dim, bias=bias, w_bits=w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
         else:
             self.to_k = None
             self.to_v = None
 
         self.added_proj_bias = added_proj_bias
         if self.added_kv_proj_dim is not None:
-            self.add_k_proj = QuantizeLinear(added_kv_proj_dim, self.inner_kv_dim, bias=added_proj_bias, w_bits=w_bits)
-            self.add_v_proj = QuantizeLinear(added_kv_proj_dim, self.inner_kv_dim, bias=added_proj_bias, w_bits=w_bits)
+            self.add_k_proj = QuantizeLinear(added_kv_proj_dim, self.inner_kv_dim, bias=added_proj_bias, w_bits=w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
+            self.add_v_proj = QuantizeLinear(added_kv_proj_dim, self.inner_kv_dim, bias=added_proj_bias, w_bits=w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
             if self.context_pre_only is not None:
-                self.add_q_proj = QuantizeLinear(added_kv_proj_dim, self.inner_dim, bias=added_proj_bias, w_bits=w_bits)
+                self.add_q_proj = QuantizeLinear(added_kv_proj_dim, self.inner_dim, bias=added_proj_bias, w_bits=w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
         else:
             self.add_q_proj = None
             self.add_k_proj = None
@@ -407,13 +410,13 @@ class Attention(nn.Module):
 
         if not self.pre_only:
             self.to_out = nn.ModuleList([])
-            self.to_out.append(QuantizeLinear(self.inner_dim, self.out_dim, bias=out_bias, w_bits=w_bits))
+            self.to_out.append(QuantizeLinear(self.inner_dim, self.out_dim, bias=out_bias, w_bits=w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha))
             self.to_out.append(nn.Dropout(dropout))
         else:
             self.to_out = None
 
         if self.context_pre_only is not None and not self.context_pre_only:
-            self.to_add_out = QuantizeLinear(self.inner_dim, self.out_context_dim, bias=out_bias, w_bits=w_bits)
+            self.to_add_out = QuantizeLinear(self.inner_dim, self.out_context_dim, bias=out_bias, w_bits=w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
         else:
             self.to_add_out = None
 
@@ -1003,6 +1006,9 @@ class FeedForward(nn.Module):
         inner_dim=None,
         bias: bool = True,
         w_bits: int = 0,
+        use_low_rank: bool = False,
+        low_rank_dim: int = 0,
+        low_rank_alpha: float = 0.0,
     ):
         super().__init__()
         if inner_dim is None:
@@ -1012,7 +1018,7 @@ class FeedForward(nn.Module):
         if activation_fn == "gelu":
             act_fn = GELU(dim, inner_dim, bias=bias)
         if activation_fn == "gelu-approximate":
-            act_fn = GELU(dim, inner_dim, approximate="tanh", bias=bias, w_bits=w_bits)
+            act_fn = GELU(dim, inner_dim, approximate="tanh", bias=bias, w_bits=w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
         elif activation_fn == "geglu":
             act_fn = GEGLU(dim, inner_dim, bias=bias)
         elif activation_fn == "geglu-approximate":
@@ -1028,7 +1034,7 @@ class FeedForward(nn.Module):
         # project dropout
         self.net.append(nn.Dropout(dropout))
         # project out
-        self.net.append(QuantizeLinear(inner_dim, dim_out, bias=bias, w_bits=w_bits))
+        self.net.append(QuantizeLinear(inner_dim, dim_out, bias=bias, w_bits=w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha))
         # FF as used in Vision Transformer, MLP-Mixer, etc. have a final dropout
         if final_dropout:
             self.net.append(nn.Dropout(dropout))
@@ -1044,11 +1050,11 @@ class FeedForward(nn.Module):
 #########################################################################################################
 @maybe_allow_in_graph
 class FluxSingleTransformerBlock(nn.Module):
-    def __init__(self, dim: int, num_attention_heads: int, attention_head_dim: int, mlp_ratio: float = 4.0, w_bits: int = 0):
+    def __init__(self, dim: int, num_attention_heads: int, attention_head_dim: int, mlp_ratio: float = 4.0, w_bits: int = 0, use_low_rank: bool = False, low_rank_dim: int = 0, low_rank_alpha: float = 0.0):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
-        self.norm = AdaLayerNormZeroSingle(dim, w_bits=w_bits)
+        self.norm = AdaLayerNormZeroSingle(dim, w_bits=w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
         self.proj_mlp = QuantizeLinear(dim, self.mlp_hidden_dim, w_bits=w_bits, bias=True)
         self.act_mlp = nn.GELU(approximate="tanh")
         self.proj_out = QuantizeLinear(dim + self.mlp_hidden_dim, dim, w_bits=w_bits, bias=True)
@@ -1075,6 +1081,9 @@ class FluxSingleTransformerBlock(nn.Module):
             eps=1e-6,
             pre_only=True,
             w_bits=w_bits,
+            use_low_rank=use_low_rank,
+            low_rank_dim=low_rank_dim,
+            low_rank_alpha=low_rank_alpha
         )
 
     def forward(
@@ -1113,12 +1122,12 @@ class FluxSingleTransformerBlock(nn.Module):
 class FluxTransformerBlock(nn.Module):
     def __init__(
         self, dim: int, num_attention_heads: int, attention_head_dim: int, qk_norm: str = "rms_norm", eps: float = 1e-6,
-        w_bits: int = 0,
+        w_bits: int = 0, use_low_rank: bool = False, low_rank_dim: int = 0, low_rank_alpha: float = 0.0
     ):
         super().__init__()
 
-        self.norm1 = AdaLayerNormZero(dim, w_bits=w_bits)
-        self.norm1_context = AdaLayerNormZero(dim, w_bits=w_bits)
+        self.norm1 = AdaLayerNormZero(dim, w_bits=w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
+        self.norm1_context = AdaLayerNormZero(dim, w_bits=w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
 
         self.attn = Attention(
             query_dim=dim,
@@ -1133,13 +1142,16 @@ class FluxTransformerBlock(nn.Module):
             qk_norm=qk_norm,
             eps=eps,
             w_bits=w_bits,
+            use_low_rank=use_low_rank,
+            low_rank_dim=low_rank_dim,
+            low_rank_alpha=low_rank_alpha
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate", w_bits=w_bits)
+        self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate", w_bits=w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff_context = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate", w_bits=w_bits)
+        self.ff_context = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate", w_bits=w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
 
     def forward(
         self,
@@ -1253,16 +1265,17 @@ class FluxTransformer2DModel(
         axes_dims_rope: Tuple[int, int, int] = (16, 56, 56),
         w_bits = 0, # 0: 1.58bit, 2: 2bit
         dataset_collect: bool = False,
+        use_low_rank: bool = False,
+        low_rank_dim: int = 16,
+        low_rank_alpha: float = 1.0        
     ):
 
         self.w_bits = w_bits
         self.dataset_collect = dataset_collect
-        if self.dataset_collect:
-            logger.info("Dataset Collection")
-            self.dataset_dict = {'input': [], 'output': []}
-            self.w_bits = 16
-        logger.info(f"Using FluxTransformer2DModel with w_bits={self.w_bits}")
-
+        self.use_low_rank = use_low_rank
+        self.low_rank_dim = low_rank_dim
+        self.low_rank_alpha = low_rank_alpha
+        
         super().__init__()
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
@@ -1286,6 +1299,9 @@ class FluxTransformer2DModel(
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
                     w_bits=w_bits,
+                    use_low_rank=use_low_rank,
+                    low_rank_dim=low_rank_dim,
+                    low_rank_alpha=low_rank_alpha
                 )
                 for _ in range(num_layers)
             ]
@@ -1298,6 +1314,9 @@ class FluxTransformer2DModel(
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
                     w_bits=w_bits,
+                    use_low_rank=use_low_rank,
+                    low_rank_dim=low_rank_dim,
+                    low_rank_alpha=low_rank_alpha
                 )
                 for _ in range(num_single_layers)
             ]
