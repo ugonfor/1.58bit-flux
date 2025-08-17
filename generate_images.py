@@ -273,8 +273,133 @@ def initialize_low_rank_with_svd_parallel(model, w_bits, low_rank_dim):
     torch.cuda.empty_cache()
 
 
+def initialize_low_rank_original_svd_task(args):
+    """subtract_before_quant 방법을 위한 원본 weight SVD 초기화 헬퍼 함수"""
+    low_rank_A_name, original_weight, low_rank_dim = args
+
+    with torch.no_grad():
+        # Move tensors to GPU if available
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        original_weight = original_weight.to(device)
+
+        # Convert to float32 for SVD computation if needed
+        original_dtype = original_weight.dtype
+        if original_weight.dtype == torch.bfloat16:
+            original_weight = original_weight.float()
+
+        # SVD decomposition of original weight (on GPU)
+        U, S, Vt = torch.linalg.svd(original_weight, full_matrices=False)
+
+        # Take top-k components
+        k = min(low_rank_dim, S.shape[0])
+        U_k = U[:, :k]
+        S_k = S[:k]
+        Vt_k = Vt[:k, :]
+
+        # Initialize A and B such that A @ B ≈ original weight의 low-rank approximation
+        # A = U_k @ sqrt(S_k), B = sqrt(S_k) @ Vt_k
+        sqrt_S_k = torch.sqrt(S_k).unsqueeze(0)
+        A_init = U_k * sqrt_S_k
+        B_init = sqrt_S_k.T * Vt_k
+
+        # Pad with zeros if low_rank_dim > k
+        if low_rank_dim > k:
+            A_pad = torch.zeros(
+                original_weight.shape[0],
+                low_rank_dim - k,
+                device=A_init.device,
+                dtype=A_init.dtype,
+            )
+            B_pad = torch.zeros(
+                low_rank_dim - k,
+                original_weight.shape[1],
+                device=B_init.device,
+                dtype=B_init.dtype,
+            )
+            A_init = torch.cat([A_init, A_pad], dim=1)
+            B_init = torch.cat([B_init, B_pad], dim=0)
+
+        # Convert back to original dtype
+        if original_dtype == torch.bfloat16:
+            A_init = A_init.to(original_dtype)
+            B_init = B_init.to(original_dtype)
+
+        # Move results back to CPU to free GPU memory
+        A_init = A_init.cpu()
+        B_init = B_init.cpu()
+
+        # Clear intermediate tensors from GPU
+        del U, S, Vt, U_k, S_k, Vt_k, sqrt_S_k
+        if low_rank_dim > k:
+            del A_pad, B_pad
+        torch.cuda.empty_cache()
+
+        low_rank_B_name = low_rank_A_name.replace("low_rank_A", "low_rank_B")
+        return low_rank_A_name, A_init, low_rank_B_name, B_init
+
+
+def initialize_low_rank_with_original_svd_parallel(model, low_rank_dim):
+    """subtract_before_quant 방법을 위한 원본 weight SVD 병렬 초기화"""
+    named_params = dict(model.named_parameters())
+
+    # Prepare tasks for parallel original weight SVD
+    svd_tasks = []
+    for name, param in named_params.items():
+        if "low_rank_A" in name:
+            weight_name = name.replace("low_rank_A", "weight")
+            original_weight = named_params.get(weight_name)
+
+            if original_weight is not None:
+                # Move to CPU to avoid GPU memory buildup
+                svd_tasks.append(
+                    (
+                        name,
+                        original_weight.cpu(),
+                        low_rank_dim,
+                    )
+                )
+
+    # Process SVD tasks in parallel with limited workers
+    with ThreadPoolExecutor(
+        max_workers=min(8, len(svd_tasks))  # GPU 메모리를 고려해서 worker 수 제한
+    ) as executor:
+        svd_results = list(
+            tqdm(
+                executor.map(initialize_low_rank_original_svd_task, svd_tasks),
+                total=len(svd_tasks),
+                desc="Initializing low-rank with original weight SVD",
+            )
+        )
+
+    # Clear SVD tasks
+    del svd_tasks
+    torch.cuda.empty_cache()
+
+    # Update model parameters
+    low_rank_dict = {}
+    for A_name, A_init, B_name, B_init in svd_results:
+        low_rank_dict[A_name] = A_init
+        low_rank_dict[B_name] = B_init
+
+    # Clear results
+    del svd_results
+    torch.cuda.empty_cache()
+
+    # Load the initialized low-rank parameters
+    model.load_state_dict(low_rank_dict, assign=True, strict=False)
+
+    # Clear dictionary
+    del low_rank_dict
+    torch.cuda.empty_cache()
+
+
 def load_quantized_model(
-    model_name, w_bits=16, use_low_rank=False, low_rank_dim=16, low_rank_alpha=1.0
+    model_name,
+    w_bits=16,
+    use_low_rank=False,
+    low_rank_dim=16,
+    low_rank_alpha=1.0,
+    low_rank_method="add_after_quant",
 ):
     model = FluxTransformer2DModelQuant.from_pretrained(
         pretrained_model_name_or_path=model_name,
@@ -286,6 +411,7 @@ def load_quantized_model(
         use_low_rank=use_low_rank,
         low_rank_dim=low_rank_dim,
         low_rank_alpha=low_rank_alpha,
+        low_rank_method=low_rank_method,
     )
 
     weight_scale_dict = {}
@@ -322,10 +448,14 @@ def load_quantized_model(
         # Load quantization parameters
         model.load_state_dict(weight_scale_dict, assign=True, strict=False)
 
-        # Initialize low-rank branch with parallel SVD if enabled
+        # Initialize low-rank branch based on method
         if use_low_rank:
-            print("Initializing low-rank branches with parallel SVD...")
-            initialize_low_rank_with_svd_parallel(model, w_bits, low_rank_dim)
+            if low_rank_method == "add_after_quant":
+                print("Initializing low-rank branches with residual SVD...")
+                initialize_low_rank_with_svd_parallel(model, w_bits, low_rank_dim)
+            elif low_rank_method == "subtract_before_quant":
+                print("Initializing low-rank branches with original weight SVD...")
+                initialize_low_rank_with_original_svd_parallel(model, low_rank_dim)
 
     else:
         raise NotImplementedError
@@ -346,7 +476,7 @@ def generate_images(pipe, prompt, output_dir, seed):
     image.save(output_dir / f"{image_index}.png")
 
 
-def main(prompt):
+def main(prompt, low_rank_method="add_after_quant"):
     # Sanity Check Full Precision
     model_name = "black-forest-labs/FLUX.1-dev"
     pipe: FluxPipeline = DiffusionPipeline.from_pretrained(
@@ -355,8 +485,8 @@ def main(prompt):
     count_parameters(pipe.transformer)
 
     samples_dir = Path("output") / "samples"
-    generate_images(pipe, prompt, samples_dir / "bf16", seed=42)
-    print(f"Samples saved to '{samples_dir / 'bf16'}'")
+    generate_images(pipe, prompt, samples_dir / f"bf16_{low_rank_method}", seed=42)
+    print(f"Samples saved to '{samples_dir / f'bf16_{low_rank_method}'}'")
 
     pipe.transformer.to("cpu")
     del pipe.transformer
@@ -370,13 +500,17 @@ def main(prompt):
                 w_bits=w_bits,
                 use_low_rank=low_rank != 0,
                 low_rank_dim=low_rank,
+                low_rank_method=low_rank_method,
             )
             count_parameters(pipe.transformer)
             generate_images(
-                pipe, prompt, samples_dir / f"w{w_bits}" / f"rank{low_rank}", seed=42
+                pipe,
+                prompt,
+                samples_dir / f"w{w_bits}_{low_rank_method}" / f"rank{low_rank}",
+                seed=42,
             )
             print(
-                f"Samples saved to '{samples_dir / f'w{w_bits}' / f'rank{low_rank}'}'"
+                f"Samples saved to '{samples_dir / f'w{w_bits}_{low_rank_method}' / f'rank{low_rank}'}'"
             )
 
             # Clean up after each iteration
@@ -386,7 +520,14 @@ def main(prompt):
 
 
 if __name__ == "__main__":
-    main(
-        prompt="Cyberpunk samurai on a neon-lit rooftop at dusk, dramatic rim lighting, 32-bit render"
-    )
-    main(prompt="A fantasy landscape with mountains and a river")
+    # Test both methods
+    for method in ["add_after_quant", "subtract_before_quant"]:
+        print(f"\n=== Testing {method} method ===")
+        main(
+            prompt="Cyberpunk samurai on a neon-lit rooftop at dusk, dramatic rim lighting, 32-bit render",
+            low_rank_method=method,
+        )
+        main(
+            prompt="A fantasy landscape with mountains and a river",
+            low_rank_method=method,
+        )

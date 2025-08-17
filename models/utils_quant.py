@@ -53,6 +53,7 @@ class QuantizeLinear(nn.Linear):
         use_low_rank=False,
         low_rank_dim=None,
         low_rank_alpha=1.0,
+        low_rank_method="add_after_quant",
     ):
         super(QuantizeLinear, self).__init__(*kargs, bias=bias)
         self.w_bits = w_bits
@@ -60,6 +61,7 @@ class QuantizeLinear(nn.Linear):
         self.use_low_rank = use_low_rank
         self.low_rank_alpha = low_rank_alpha
         self.low_rank_dim = low_rank_dim
+        self.low_rank_method = low_rank_method
 
         # Low rank decomposition parameters (not quantized)
         if self.use_low_rank:
@@ -69,7 +71,8 @@ class QuantizeLinear(nn.Linear):
             in_features = self.weight.shape[1]
             out_features = self.weight.shape[0]
 
-            # Initialize low rank matrices A and B (full precision)
+            # Initialize low rank matrices A and B with small random values
+            # SVD initialization will be done later in generate_images.py for speed
             self.low_rank_A = nn.Parameter(
                 torch.randn(out_features, low_rank_dim) * 0.01
             )
@@ -97,23 +100,44 @@ class QuantizeLinear(nn.Linear):
 
         if self.w_bits >= 16:
             base_weight = self.weight
+            # Add low rank branch if enabled (full precision)
+            if self.use_low_rank:
+                low_rank_weight = torch.matmul(self.low_rank_A, self.low_rank_B)
+                final_weight = base_weight + self.low_rank_alpha * low_rank_weight
+            else:
+                final_weight = base_weight
         elif self.w_bits <= 8:
-            base_weight = LinearQuant(
-                real_weights,
-                self.weight_scale,
-                self.weight_zero_point,
-                self.w_bits,
-                self.weight_layerwise,
-            ).to(input_.dtype)
+            if self.use_low_rank and self.low_rank_method == "subtract_before_quant":
+                # Method 2: Subtract low-rank before quantization, add back after
+                low_rank_weight = torch.matmul(self.low_rank_A, self.low_rank_B)
+                weight_for_quant = real_weights - self.low_rank_alpha * low_rank_weight
+
+                base_weight = LinearQuant(
+                    weight_for_quant,
+                    self.weight_scale,
+                    self.weight_zero_point,
+                    self.w_bits,
+                    self.weight_layerwise,
+                ).to(input_.dtype)
+
+                final_weight = base_weight + self.low_rank_alpha * low_rank_weight
+            else:
+                # Method 1: Quantize first, then add low-rank (기존 방법)
+                base_weight = LinearQuant(
+                    real_weights,
+                    self.weight_scale,
+                    self.weight_zero_point,
+                    self.w_bits,
+                    self.weight_layerwise,
+                ).to(input_.dtype)
+
+                if self.use_low_rank:
+                    low_rank_weight = torch.matmul(self.low_rank_A, self.low_rank_B)
+                    final_weight = base_weight + self.low_rank_alpha * low_rank_weight
+                else:
+                    final_weight = base_weight
         else:
             raise NotImplementedError
-
-        # Add low rank branch if enabled (full precision)
-        if self.use_low_rank:
-            low_rank_weight = torch.matmul(self.low_rank_A, self.low_rank_B)
-            final_weight = base_weight + self.low_rank_alpha * low_rank_weight
-        else:
-            final_weight = base_weight
 
         out = nn.functional.linear(input_, final_weight)
         if self.bias is not None:
@@ -122,4 +146,4 @@ class QuantizeLinear(nn.Linear):
         return out
 
     def extra_repr(self) -> str:
-        return f"w_bits={self.w_bits}, weight_layerwise={self.weight_layerwise}, use_low_rank={self.use_low_rank}, low_rank_dim={self.low_rank_dim}, low_rank_alpha={self.low_rank_alpha}"
+        return f"w_bits={self.w_bits}, weight_layerwise={self.weight_layerwise}, use_low_rank={self.use_low_rank}, low_rank_dim={self.low_rank_dim}, low_rank_alpha={self.low_rank_alpha}, low_rank_method={self.low_rank_method}"
