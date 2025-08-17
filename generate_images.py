@@ -89,6 +89,11 @@ def initialize_low_rank_svd_task(args):
         # Calculate residual
         residual = original_weight - quantized_weight
 
+        # Convert to float32 for SVD computation if needed
+        original_dtype = residual.dtype
+        if residual.dtype == torch.bfloat16:
+            residual = residual.float()
+
         # SVD decomposition of residual
         U, S, Vt = torch.linalg.svd(residual, full_matrices=False)
 
@@ -120,6 +125,11 @@ def initialize_low_rank_svd_task(args):
             )
             A_init = torch.cat([A_init, A_pad], dim=1)
             B_init = torch.cat([B_init, B_pad], dim=0)
+
+        # Convert back to original dtype
+        if original_dtype == torch.bfloat16:
+            A_init = A_init.to(original_dtype)
+            B_init = B_init.to(original_dtype)
 
         low_rank_B_name = low_rank_A_name.replace("low_rank_A", "low_rank_B")
         return low_rank_A_name, A_init, low_rank_B_name, B_init
