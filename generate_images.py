@@ -386,7 +386,7 @@ def main(prompt):
 
 
 if __name__ == "__main__":
-    main(prompt="A fantasy landscape with mountains and a river")
     main(
         prompt="Cyberpunk samurai on a neon-lit rooftop at dusk, dramatic rim lighting, 32-bit render"
     )
+    main(prompt="A fantasy landscape with mountains and a river")
