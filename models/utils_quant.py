@@ -9,20 +9,42 @@ import torch.nn as nn
 
 def low_rank_decomposition(weight, reduced_rank=32):
     """
-    :param          weight: The matrix to decompose, of shape (H, W)
-    :param    reduced_rank: rank_of_decomposed_matrix
-    :return: L, R
+    :param          weight: (H, W) 2D matrix (can be on CPU or CUDA)
+    :param    reduced_rank: target rank r
+    :return: L (H, r), R (r, W)
     """
+    assert weight.dim() == 2, "Only Support 2D matrix"
 
-    matrix_dimension = len(weight.size())
-    assert matrix_dimension == 2, "Only Support 2D matrix"
+    H, W = weight.shape
+    r = int(reduced_rank)
+    assert 1 <= r <= min(H, W), f"reduced_rank must be in [1, {min(H, W)}]"
 
-    U, S, Vh = torch.linalg.svd(weight, full_matrices=False)
-    reduced_rank = int(reduced_rank)
+    # keep original device/dtype
+    orig_device = weight.device
+    orig_dtype = weight.dtype
 
-    L = U @ (torch.sqrt(torch.diag(S)[:, 0:reduced_rank]))
-    R = torch.sqrt(torch.diag(S)[0:reduced_rank, :]) @ Vh
+    # ---- run SVD on GPU in float32 if possible ----
+    # (move only for the SVD, then move results back)
+    run_device = torch.device("cuda") if torch.cuda.is_available() else orig_device
+    W32 = weight.to(run_device, dtype=torch.float32, copy=(run_device != orig_device or weight.dtype != torch.float32))
 
+    # cuSOLVER backend (GPU) or MAGMA/LAPACK (CPU)
+    # full_matrices=False gives thin SVD
+    U, S, Vh = torch.linalg.svd(W32, full_matrices=False)
+
+    # Truncate to rank r
+    U = U[:, :r]              # (H, r)
+    S = S[:r]                 # (r,)
+    Vh = Vh[:r, :]            # (r, W)
+
+    # Build L, R without forming diag(S): cheaper & numerically nicer
+    sqrtS = torch.sqrt(S)     # (r,)
+    L = U * sqrtS             # (H, r)  broadcast over columns
+    R = sqrtS.unsqueeze(1) * Vh  # (r, 1) * (r, W) -> (r, W)
+
+    # Move back to original device/dtype
+    L = L.to(device=orig_device, dtype=orig_dtype)
+    R = R.to(device=orig_device, dtype=orig_dtype)
     return L, R
 
 
