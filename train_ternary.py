@@ -187,6 +187,8 @@ def parse_args():
     p.add_argument("--grad-checkpointing", action="store_true")
     p.add_argument("--grad-accum",         type=int,   default=1)
     p.add_argument("--no-svd",             action="store_true")
+    p.add_argument("--init-ckpt",          type=str,   default=None,
+                   help="Path to a prior checkpoint to warm-start from (loads scale+lora weights)")
     return p.parse_args()
 
 
@@ -219,6 +221,14 @@ def main():
     quantize_to_ternary(pipe.transformer, per_channel=True,
                         lora_rank=args.rank, svd_init=not args.no_svd)
     print(f"    Ternary transformer: {memory_stats(pipe.transformer)['total_mb']:.0f} MB")
+
+    if args.init_ckpt:
+        ckpt = torch.load(args.init_ckpt, map_location=device, weights_only=True)
+        state = {k: v for k, v in pipe.transformer.named_parameters()}
+        for n, t in ckpt.items():
+            if n in state:
+                state[n].data.copy_(t.to(dtype))
+        print(f"    Loaded {len(ckpt)} tensors from {args.init_ckpt}")
 
     if args.grad_checkpointing:
         pipe.transformer.enable_gradient_checkpointing()
