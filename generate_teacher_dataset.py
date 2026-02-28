@@ -109,7 +109,7 @@ def main():
     pipe = FluxPipeline.from_pretrained(
         MODEL_NAME, torch_dtype=dtype, local_files_only=True,
     ).to(device)
-    print(f"  VRAM: {torch.cuda.memory_allocated()/1024**3:.1f} GB")
+    print(f"  VRAM after load: {torch.cuda.memory_allocated()/1024**3:.1f} GB")
 
     dataset = []
     t0 = time.time()
@@ -117,10 +117,9 @@ def main():
     for i in range(args.n_images):
         prompt = PROMPTS[i % len(PROMPTS)]
         seed   = args.seed + i
-
         gen = torch.Generator("cuda").manual_seed(seed)
 
-        # Generate with output_type="latent" to skip VAE decode → get raw latent z_0
+        # Generate with output_type="latent" → packed z_0 [1, seq_len, 64]
         with torch.no_grad():
             result = pipe(
                 prompt,
@@ -129,24 +128,28 @@ def main():
                 guidance_scale=3.5,
                 height=args.res,
                 width=args.res,
-                output_type="latent",  # returns packed latent [1, H/2*W/2, 64]
+                output_type="latent",
             )
-        latent = result.images  # [1, seq_len, 64] packed latent
+        latent = result.images.cpu()
+        del result  # release inference activations
 
-        # Encode prompt
-        pe, poe, ti = pipe.encode_prompt(
-            prompt=prompt, prompt_2=None, device=device,
-            num_images_per_prompt=1, max_sequence_length=256,
-        )
+        # Encode prompt (text encoders on GPU)
+        with torch.no_grad():
+            pe, poe, ti = pipe.encode_prompt(
+                prompt=prompt, prompt_2=None, device=device,
+                num_images_per_prompt=1, max_sequence_length=256,
+            )
 
         dataset.append({
-            "latent_z0":    latent.cpu(),          # [1, seq_len, 64] packed
-            "prompt_embeds": pe.cpu(),             # [1, 512, 4096]
-            "pooled_embeds": poe.cpu(),            # [1, 768]
-            "text_ids":      ti.cpu(),             # [1, 512, 3]
+            "latent_z0":     latent,
+            "prompt_embeds": pe.cpu(),
+            "pooled_embeds": poe.cpu(),
+            "text_ids":      ti.cpu(),
             "prompt":        prompt,
             "seed":          seed,
         })
+        del pe, poe, ti
+        torch.cuda.empty_cache()  # release caching allocator memory after each image
 
         elapsed = time.time() - t0
         remaining = elapsed / (i + 1) * (args.n_images - i - 1)
