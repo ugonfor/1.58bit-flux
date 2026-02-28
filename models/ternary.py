@@ -21,6 +21,16 @@ def _svd_low_rank(E: torch.Tensor, rank: int):
     return L, R
 
 
+def _ternary_quant(W: torch.Tensor, per_channel: bool):
+    """Quantize W to ternary {-1,0,+1} with absmean scale. Returns (W_q int8, scale float32)."""
+    if per_channel:
+        scale = W.abs().mean(dim=1, keepdim=True).clamp(min=1e-8)
+    else:
+        scale = W.abs().mean().clamp(min=1e-8)
+    W_q = (W / scale).round().clamp_(-1, 1).to(torch.int8)
+    return W_q, scale
+
+
 class TernaryLinear(nn.Module):
     """
     Linear layer with ternary weights {-1, 0, +1}.
@@ -31,6 +41,9 @@ class TernaryLinear(nn.Module):
     Trainable params (when used for distillation fine-tuning):
         - scale:   per-channel absmean multiplier  (nn.Parameter)
         - lora_A, lora_B: low-rank residual adapter (nn.Parameter, zero-or-SVD init)
+
+    When loftq_iters > 1, alternating quantization/SVD refinement (LoftQ algorithm)
+    is used to minimize ||W - (W_q * scale + lora_A @ lora_B)||_F before training starts.
     """
 
     def __init__(
@@ -39,40 +52,63 @@ class TernaryLinear(nn.Module):
         per_channel: bool = True,
         lora_rank: int = 0,
         svd_init: bool = True,
+        loftq_iters: int = 1,
     ):
         super().__init__()
         W = linear.weight.data.float()  # (out, in)
+        dtype = linear.weight.dtype
+        dev   = linear.weight.device
+        out_f, in_f = W.shape
 
-        # ---- ternary quantization ----
-        if per_channel:
-            scale = W.abs().mean(dim=1, keepdim=True).clamp(min=1e-8)
-        else:
-            scale = W.abs().mean().clamp(min=1e-8)
+        # ---- initial ternary quantization (of raw W) ----
+        W_q, scale = _ternary_quant(W, per_channel)
 
-        W_q = (W / scale).round().clamp_(-1, 1).to(torch.int8)
-        self.register_buffer("weight_q", W_q)               # frozen ternary (int8)
-        self.scale = nn.Parameter(scale.to(linear.weight.dtype))  # trainable
-
-        # ---- optional LoRA adapter ----
         self.lora_rank = lora_rank
-        if lora_rank > 0:
-            out_f, in_f = W.shape
-            dtype = linear.weight.dtype
-            dev = linear.weight.device
-            self.lora_A = nn.Parameter(torch.zeros(out_f, lora_rank, dtype=dtype, device=dev))
-            self.lora_B = nn.Parameter(torch.zeros(lora_rank, in_f, dtype=dtype, device=dev))
 
-            if svd_init and min(out_f, in_f) >= lora_rank:
-                # Init LoRA from SVD of ternary quantization residual
-                W_base = W_q.float() * scale.float()  # ternary reconstruction
-                E = (W - W_base).to(dtype)
-                r = min(lora_rank, min(out_f, in_f))
-                L, R = _svd_low_rank(E, r)
-                self.lora_A.data[:, :r].copy_(L)
-                self.lora_B.data[:r, :].copy_(R)
+        if lora_rank > 0 and svd_init and min(out_f, in_f) >= lora_rank:
+            r = min(lora_rank, min(out_f, in_f))
+
+            if loftq_iters <= 1:
+                # Single-step SVD init: fit LoRA to ternary residual.
+                E = W - W_q.float() * scale
+                L, R = _svd_low_rank(E.to(dtype), r)
+            else:
+                # Iterative LoftQ (LoftQ paper, adapted for ternary).
+                # Each iteration: re-quantize (W - LoRA), then fit LoRA to total residual.
+                # NOTE: tested on synthetic data — improvement depends on weight distribution.
+                L = torch.zeros(out_f, r, dtype=torch.float32, device=dev)
+                R = torch.zeros(r, in_f, dtype=torch.float32, device=dev)
+                for _ in range(loftq_iters):
+                    # Re-quantize what the ternary must capture (W minus current LoRA)
+                    W_for_ternary = W - (L @ R)
+                    W_q, scale = _ternary_quant(W_for_ternary, per_channel)
+                    # Fit LoRA to TOTAL residual of W (not just W_for_ternary residual)
+                    E = W - W_q.float() * scale
+                    L_new, R_new = _svd_low_rank(E.to(dtype), r)
+                    L = L_new.float()
+                    R = R_new.float()
+                L = L.to(dtype)
+                R = R.to(dtype)
+
+            lora_A_init = torch.zeros(out_f, lora_rank, dtype=dtype, device=dev)
+            lora_B_init = torch.zeros(lora_rank, in_f,  dtype=dtype, device=dev)
+            lora_A_init[:, :r].copy_(L)
+            lora_B_init[:r, :].copy_(R)
+        else:
+            lora_A_init = None
+            lora_B_init = None
+
+        self.register_buffer("weight_q", W_q)
+        self.scale = nn.Parameter(scale.to(dtype))
+
+        if lora_rank > 0:
+            self.lora_A = nn.Parameter(lora_A_init if lora_A_init is not None
+                                       else torch.zeros(out_f, lora_rank, dtype=dtype, device=dev))
+            self.lora_B = nn.Parameter(lora_B_init if lora_B_init is not None
+                                       else torch.zeros(lora_rank, in_f,  dtype=dtype, device=dev))
 
         self.bias = linear.bias
-        self.in_features = linear.in_features
+        self.in_features  = linear.in_features
         self.out_features = linear.out_features
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -97,6 +133,7 @@ def quantize_to_ternary(
     per_channel: bool = True,
     lora_rank: int = 0,
     svd_init: bool = True,
+    loftq_iters: int = 1,
     verbose: bool = False,
 ) -> nn.Module:
     """Replace all nn.Linear layers with TernaryLinear in-place."""
@@ -110,7 +147,8 @@ def quantize_to_ternary(
                 pass
             elif isinstance(child, nn.Linear):
                 tl = TernaryLinear(child, per_channel=per_channel,
-                                   lora_rank=lora_rank, svd_init=svd_init)
+                                   lora_rank=lora_rank, svd_init=svd_init,
+                                   loftq_iters=loftq_iters)
                 setattr(module, name, tl)
                 replaced += 1
                 if verbose:
@@ -120,7 +158,7 @@ def quantize_to_ternary(
 
     _replace(model)
     print(f"[ternary] Quantized {replaced} Linear → TernaryLinear "
-          f"(lora_rank={lora_rank}, svd_init={svd_init})")
+          f"(lora_rank={lora_rank}, svd_init={svd_init}, loftq_iters={loftq_iters})")
     return model
 
 

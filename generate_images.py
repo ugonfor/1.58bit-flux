@@ -13,9 +13,11 @@ import glob
 
 import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor
+from typing import Tuple, Dict, Any
+
+from models.utils_quant import QuantizeLinear
 
 log = logging.getLogger(__name__)
-
 
 def count_parameters(model):
     from models.utils_quant import QuantizeLinear
@@ -58,339 +60,105 @@ def count_parameters(model):
     }
 
 
-def calculate_scale_and_zero_point(args):
-    """병렬 처리를 위한 헬퍼 함수"""
-    name, weight_param, w_bits = args
+@torch.no_grad()
+def _init_one_layer_on_stream(
+    name: str,
+    layer: "QuantizeLinear",
+    do_svd: bool,
+    do_quant: bool,
+    stream: torch.cuda.Stream,
+    eps: float = 1e-8,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    한 레이어에 대해 기존 클래스 메서드만 사용:
+      - layer.svd_init_low_rank()
+      - layer.initialize_quant_params()
+    를 지정된 CUDA stream에서 실행.
+    """
+    with torch.cuda.stream(stream):
+        info = {
+            "shape": tuple(layer.weight.shape),
+            "use_low_rank": bool(layer.use_low_rank),
+            "w_bits": int(layer.w_bits),
+            "weight_layerwise": bool(getattr(layer, "weight_layerwise", False)),
+        }
 
-    # Calculate scale
-    xmax, _ = torch.max(torch.abs(weight_param), dim=-1, keepdim=True)
-    maxq = 2 ** (w_bits - 1) - 1
-    scale = xmax / maxq
+        # GPU에 없으면 이동
+        if layer.weight.device.type != "cuda":
+            layer.to("cuda")
 
-    # Calculate zero_point
-    zero_point_name = name.replace("weight_scale", "weight_zero_point")
-    xmin, _ = torch.min(weight_param, dim=-1, keepdim=True)
-    xmax, _ = torch.max(weight_param, dim=-1, keepdim=True)
-    qmin = 0
-    qmax = 2**w_bits - 1
+        # 1) SVD(저랭크) 초기화
+        if do_svd and layer.use_low_rank:
+            # 클래스에 이미 있는 메서드를 그대로 사용
+            layer.svd_init_low_rank()  # reduced_rank는 내부적으로 low_rank_dim 사용
 
-    # Calculate zero point: zero_point = qmin - round(xmin / scale)
-    zero_point = qmin - torch.round(xmin / scale)
-    zero_point = torch.clamp(zero_point, qmin, qmax)
+        # 2) 양자화 파라미터 초기화
+        if do_quant and layer.w_bits < 16:
+            # 클래스 메서드 그대로 사용
+            layer.initialize_quant_params(eps=eps)
 
-    return name, scale, zero_point_name, zero_point
-
-
-def initialize_low_rank_svd_task(args):
-    """병렬 처리를 위한 SVD 초기화 헬퍼 함수"""
-    low_rank_A_name, original_weight, quantized_weight, low_rank_dim = args
-
-    with torch.no_grad():
-        # Move tensors to GPU if available and they're not already there
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        original_weight = original_weight.to(device)
-        quantized_weight = quantized_weight.to(device)
-
-        # Calculate residual
-        residual = original_weight - quantized_weight
-
-        # Convert to float32 for SVD computation if needed
-        original_dtype = residual.dtype
-        if residual.dtype == torch.bfloat16:
-            residual = residual.float()
-
-        # SVD decomposition of residual (on GPU)
-        U, S, Vt = torch.linalg.svd(residual, full_matrices=False)
-
-        # Take top-k components
-        k = min(low_rank_dim, S.shape[0])
-        U_k = U[:, :k]
-        S_k = S[:k]
-        Vt_k = Vt[:k, :]
-
-        # Initialize A and B such that A @ B ≈ residual
-        # A = U_k @ sqrt(S_k), B = sqrt(S_k) @ Vt_k
-        sqrt_S_k = torch.sqrt(S_k).unsqueeze(0)
-        A_init = U_k * sqrt_S_k
-        B_init = sqrt_S_k.T * Vt_k
-
-        # Pad with zeros if low_rank_dim > k
-        if low_rank_dim > k:
-            A_pad = torch.zeros(
-                original_weight.shape[0],
-                low_rank_dim - k,
-                device=A_init.device,
-                dtype=A_init.dtype,
-            )
-            B_pad = torch.zeros(
-                low_rank_dim - k,
-                original_weight.shape[1],
-                device=B_init.device,
-                dtype=B_init.dtype,
-            )
-            A_init = torch.cat([A_init, A_pad], dim=1)
-            B_init = torch.cat([B_init, B_pad], dim=0)
-
-        # Convert back to original dtype
-        if original_dtype == torch.bfloat16:
-            A_init = A_init.to(original_dtype)
-            B_init = B_init.to(original_dtype)
-
-        # Move results back to CPU to free GPU memory
-        A_init = A_init.cpu()
-        B_init = B_init.cpu()
-
-        # Clear intermediate tensors from GPU
-        del residual, U, S, Vt, U_k, S_k, Vt_k, sqrt_S_k
-        if low_rank_dim > k:
-            del A_pad, B_pad
-        torch.cuda.empty_cache()
-
-        low_rank_B_name = low_rank_A_name.replace("low_rank_A", "low_rank_B")
-        return low_rank_A_name, A_init, low_rank_B_name, B_init
+    return name, info
 
 
-def calculate_quantized_weight_task(args):
-    """병렬 처리를 위한 quantized weight 계산 헬퍼 함수"""
-    low_rank_A_name, original_weight, weight_scale, weight_zero_point, w_bits = args
+@torch.no_grad()
+def initialize_layers_parallel(
+    model: nn.Module,
+    do_svd: bool = True,
+    do_quant: bool = True,
+    max_streams: int = None,
+    verbose: bool = True,
+    eps: float = 1e-8,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    모델 내 모든 QuantizeLinear 레이어에 대해
+    클래스 메서드만 사용하여(SVD+Quant) 병렬 초기화.
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA 환경이 필요합니다.")
 
-    # Move tensors to GPU if available
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    original_weight = original_weight.to(device)
-    weight_scale = weight_scale.to(device)
-    weight_zero_point = weight_zero_point.to(device)
+    # 대상 레이어 수집
+    targets: List[Tuple[str, "QuantizeLinear"]] = [
+        (n, m) for n, m in model.named_modules() if isinstance(m, QuantizeLinear)
+    ]
+    if len(targets) == 0:
+        if verbose:
+            print("[init] QuantizeLinear 레이어가 없습니다.")
+        return {}
 
-    # Calculate quantized weight
-    from models.utils_quant import LinearQuant
+    n_layers = len(targets)
+    n_streams = max_streams or min(8, n_layers)
+    streams = [torch.cuda.Stream() for _ in range(n_streams)]
 
-    quantized_weight = LinearQuant(
-        original_weight,
-        weight_scale,
-        weight_zero_point,
-        w_bits,
-        layerwise=False,
-    ).to(original_weight.dtype)
+    if verbose:
+        print(f"[init] target layers: {n_layers}, cuda streams: {n_streams}")
+        print(f"[init] do_svd={do_svd}, do_quant={do_quant}")
 
-    # Move results back to CPU to free GPU memory
-    original_weight = original_weight.cpu()
-    quantized_weight = quantized_weight.cpu()
+    results: Dict[str, Dict[str, Any]] = {}
 
-    # Clear GPU cache
-    torch.cuda.empty_cache()
+    # Python 오버헤드 줄이기 위해 ThreadPool + 각자 stream 사용
+    with ThreadPoolExecutor(max_workers=n_streams) as ex:
+        futures = []
+        for i, (name, layer) in enumerate(targets):
+            s = streams[i % n_streams]
+            futures.append(ex.submit(_init_one_layer_on_stream, name, layer, do_svd, do_quant, s, eps))
 
-    return low_rank_A_name, original_weight, quantized_weight
+        for fut in futures:
+            try:
+                name, info = fut.result()
+                results[name] = info
+                if verbose:
+                    print(f"[init] ok: {name} {info}")
+            except Exception as e:
+                # 레이어별 에러만 기록하고 계속 진행
+                results[name] = {"error": str(e)}
+                if verbose:
+                    print(f"[init] FAIL: {name} -> {e}")
 
-
-def initialize_low_rank_with_svd_parallel(model, w_bits, low_rank_dim):
-    """병렬 SVD를 사용해서 low-rank branch를 초기화"""
-    named_params = dict(model.named_parameters())
-
-    # Prepare tasks for parallel quantized weight calculation
-    quantize_tasks = []
-    for name, param in named_params.items():
-        if "low_rank_A" in name:
-            weight_name = name.replace("low_rank_A", "weight")
-            weight_scale_name = name.replace("low_rank_A", "weight_scale")
-            weight_zero_point_name = name.replace("low_rank_A", "weight_zero_point")
-
-            original_weight = named_params.get(weight_name)
-            weight_scale = named_params.get(weight_scale_name)
-            weight_zero_point = named_params.get(weight_zero_point_name)
-
-            if all(
-                x is not None
-                for x in [original_weight, weight_scale, weight_zero_point]
-            ):
-                # Move to CPU to avoid GPU memory buildup
-                quantize_tasks.append(
-                    (
-                        name,
-                        original_weight.cpu(),
-                        weight_scale.cpu(),
-                        weight_zero_point.cpu(),
-                        w_bits,
-                    )
-                )
-
-    # Process quantized weight calculation in parallel with limited workers
-    with ThreadPoolExecutor(
-        max_workers=min(4, len(quantize_tasks))  # GPU 메모리를 고려해서 worker 수 제한
-    ) as executor:
-        quantize_results = list(
-            tqdm(
-                executor.map(calculate_quantized_weight_task, quantize_tasks),
-                total=len(quantize_tasks),
-                desc="Calculating quantized weights",
-            )
-        )
-
-    # Clear intermediate tasks
-    del quantize_tasks
-    torch.cuda.empty_cache()
-
-    # Prepare SVD tasks
-    svd_tasks = []
-    for low_rank_A_name, original_weight, quantized_weight in quantize_results:
-        svd_tasks.append(
-            (low_rank_A_name, original_weight, quantized_weight, low_rank_dim)
-        )
-
-    # Clear quantize_results
-    del quantize_results
-    torch.cuda.empty_cache()
-
-    # Process SVD tasks in parallel with limited workers
-    with ThreadPoolExecutor(
-        max_workers=min(8, len(svd_tasks))  # GPU 메모리를 고려해서 worker 수 제한
-    ) as executor:
-        svd_results = list(
-            tqdm(
-                executor.map(initialize_low_rank_svd_task, svd_tasks),
-                total=len(svd_tasks),
-                desc="Initializing low-rank with SVD",
-            )
-        )
-
-    # Clear SVD tasks
-    del svd_tasks
-    torch.cuda.empty_cache()
-
-    # Update model parameters
-    low_rank_dict = {}
-    for A_name, A_init, B_name, B_init in svd_results:
-        low_rank_dict[A_name] = A_init
-        low_rank_dict[B_name] = B_init
-
-    # Clear results
-    del svd_results
-    torch.cuda.empty_cache()
-
-    # Load the initialized low-rank parameters
-    model.load_state_dict(low_rank_dict, assign=True, strict=False)
-
-    # Clear dictionary
-    del low_rank_dict
-    torch.cuda.empty_cache()
-
-
-def initialize_low_rank_original_svd_task(args):
-    """subtract_before_quant 방법을 위한 원본 weight SVD 초기화 헬퍼 함수"""
-    low_rank_A_name, original_weight, low_rank_dim = args
-
-    with torch.no_grad():
-        # Move tensors to GPU if available
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        original_weight = original_weight.to(device)
-
-        # Convert to float32 for SVD computation if needed
-        original_dtype = original_weight.dtype
-        if original_weight.dtype == torch.bfloat16:
-            original_weight = original_weight.float()
-
-        # SVD decomposition of original weight (on GPU)
-        U, S, Vt = torch.linalg.svd(original_weight, full_matrices=False)
-
-        # Take top-k components
-        k = min(low_rank_dim, S.shape[0])
-        U_k = U[:, :k]
-        S_k = S[:k]
-        Vt_k = Vt[:k, :]
-
-        # Initialize A and B such that A @ B ≈ original weight의 low-rank approximation
-        # A = U_k @ sqrt(S_k), B = sqrt(S_k) @ Vt_k
-        sqrt_S_k = torch.sqrt(S_k).unsqueeze(0)
-        A_init = U_k * sqrt_S_k
-        B_init = sqrt_S_k.T * Vt_k
-
-        # Pad with zeros if low_rank_dim > k
-        if low_rank_dim > k:
-            A_pad = torch.zeros(
-                original_weight.shape[0],
-                low_rank_dim - k,
-                device=A_init.device,
-                dtype=A_init.dtype,
-            )
-            B_pad = torch.zeros(
-                low_rank_dim - k,
-                original_weight.shape[1],
-                device=B_init.device,
-                dtype=B_init.dtype,
-            )
-            A_init = torch.cat([A_init, A_pad], dim=1)
-            B_init = torch.cat([B_init, B_pad], dim=0)
-
-        # Convert back to original dtype
-        if original_dtype == torch.bfloat16:
-            A_init = A_init.to(original_dtype)
-            B_init = B_init.to(original_dtype)
-
-        # Move results back to CPU to free GPU memory
-        A_init = A_init.cpu()
-        B_init = B_init.cpu()
-
-        # Clear intermediate tensors from GPU
-        del U, S, Vt, U_k, S_k, Vt_k, sqrt_S_k
-        if low_rank_dim > k:
-            del A_pad, B_pad
-        torch.cuda.empty_cache()
-
-        low_rank_B_name = low_rank_A_name.replace("low_rank_A", "low_rank_B")
-        return low_rank_A_name, A_init, low_rank_B_name, B_init
-
-
-def initialize_low_rank_with_original_svd_parallel(model, low_rank_dim):
-    """subtract_before_quant 방법을 위한 원본 weight SVD 병렬 초기화"""
-    named_params = dict(model.named_parameters())
-
-    # Prepare tasks for parallel original weight SVD
-    svd_tasks = []
-    for name, param in named_params.items():
-        if "low_rank_A" in name:
-            weight_name = name.replace("low_rank_A", "weight")
-            original_weight = named_params.get(weight_name)
-
-            if original_weight is not None:
-                # Move to CPU to avoid GPU memory buildup
-                svd_tasks.append(
-                    (
-                        name,
-                        original_weight.cpu(),
-                        low_rank_dim,
-                    )
-                )
-
-    # Process SVD tasks in parallel with limited workers
-    with ThreadPoolExecutor(
-        max_workers=min(8, len(svd_tasks))  # GPU 메모리를 고려해서 worker 수 제한
-    ) as executor:
-        svd_results = list(
-            tqdm(
-                executor.map(initialize_low_rank_original_svd_task, svd_tasks),
-                total=len(svd_tasks),
-                desc="Initializing low-rank with original weight SVD",
-            )
-        )
-
-    # Clear SVD tasks
-    del svd_tasks
-    torch.cuda.empty_cache()
-
-    # Update model parameters
-    low_rank_dict = {}
-    for A_name, A_init, B_name, B_init in svd_results:
-        low_rank_dict[A_name] = A_init
-        low_rank_dict[B_name] = B_init
-
-    # Clear results
-    del svd_results
-    torch.cuda.empty_cache()
-
-    # Load the initialized low-rank parameters
-    model.load_state_dict(low_rank_dict, assign=True, strict=False)
-
-    # Clear dictionary
-    del low_rank_dict
-    torch.cuda.empty_cache()
+    # 모든 stream 동기화
+    torch.cuda.synchronize()
+    if verbose:
+        print("[init] all CUDA streams synchronized.")
+    return results
 
 
 def load_quantized_model(
@@ -399,8 +167,15 @@ def load_quantized_model(
     use_low_rank=False,
     low_rank_dim=16,
     low_rank_alpha=1.0,
-    low_rank_method="add_after_quant",
+    weight_layerwise: bool = False,
+    verbose: bool = True,
 ):
+    """
+    1) 모델 로드
+    2) GPU 이동
+    3) (클래스 내 메서드만 사용해서) 레이어별 SVD + Quant 병렬 초기화
+    """
+    # 1) 모델 로드 (사용자 코드 그대로 유지)
     model = FluxTransformer2DModelQuant.from_pretrained(
         pretrained_model_name_or_path=model_name,
         subfolder="transformer",
@@ -411,60 +186,35 @@ def load_quantized_model(
         use_low_rank=use_low_rank,
         low_rank_dim=low_rank_dim,
         low_rank_alpha=low_rank_alpha,
-        low_rank_method=low_rank_method,
     )
 
-    weight_scale_dict = {}
+    # (선택) 하위 모듈들이 QuantizeLinear일 때, 파라미터 일관성 보정
+    for m in model.modules():
+        if isinstance(m, QuantizeLinear):
+            m.w_bits = w_bits
+            m.use_low_rank = use_low_rank
+            m.low_rank_dim = low_rank_dim
+            m.low_rank_alpha = low_rank_alpha
+            if hasattr(m, "weight_layerwise"):
+                m.weight_layerwise = weight_layerwise
 
-    if w_bits <= 8:
-        # 병렬 처리를 위한 데이터 준비
-        scale_tasks = []
-        named_params = dict(model.named_parameters())
-
-        for name, param in named_params.items():
-            if "weight_scale" in name:
-                weight_name = name.replace("weight_scale", "weight")
-                weight_param = named_params.get(weight_name, None)
-                if weight_param is not None:
-                    scale_tasks.append((name, weight_param, w_bits))
-
-        # ThreadPoolExecutor 사용 (GPU 메모리 공유를 위해)
-        with ThreadPoolExecutor(
-            max_workers=min(len(scale_tasks), mp.cpu_count())
-        ) as executor:
-            results = list(
-                tqdm(
-                    executor.map(calculate_scale_and_zero_point, scale_tasks),
-                    total=len(scale_tasks),
-                    desc="Calculating scales and zero points",
-                )
-            )
-
-        # 결과를 dictionary에 저장
-        for scale_name, scale, zero_point_name, zero_point in results:
-            weight_scale_dict[scale_name] = scale
-            weight_scale_dict[zero_point_name] = zero_point
-
-        # Load quantization parameters
-        model.load_state_dict(weight_scale_dict, assign=True, strict=False)
-
-        # Initialize low-rank branch based on method
-        if use_low_rank:
-            if low_rank_method == "add_after_quant":
-                print("Initializing low-rank branches with residual SVD...")
-                initialize_low_rank_with_svd_parallel(model, w_bits, low_rank_dim)
-            elif low_rank_method == "subtract_before_quant":
-                print("Initializing low-rank branches with original weight SVD...")
-                initialize_low_rank_with_original_svd_parallel(model, low_rank_dim)
-
-    else:
-        raise NotImplementedError
-
-    # 모델을 GPU로 이동
+    # 2) GPU로 이동
     model = model.to("cuda")
 
-    return model
+    # 3) 병렬 초기화
+    do_svd = bool(use_low_rank)
+    do_quant = bool(w_bits < 16)
 
+    _ = initialize_layers_parallel(
+        model,
+        do_svd=do_svd,
+        do_quant=do_quant,
+        max_streams=None,    # 기본 8 또는 레이어 수
+        verbose=verbose,
+        eps=1e-8,
+    )
+
+    return model
 
 def generate_images(pipe, prompt, output_dir, seed):
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -476,7 +226,7 @@ def generate_images(pipe, prompt, output_dir, seed):
     image.save(output_dir / f"{image_index}.png")
 
 
-def main(prompt, low_rank_method="add_after_quant"):
+def main(prompt):
     # Sanity Check Full Precision
     model_name = "black-forest-labs/FLUX.1-dev"
     pipe: FluxPipeline = DiffusionPipeline.from_pretrained(
@@ -485,8 +235,8 @@ def main(prompt, low_rank_method="add_after_quant"):
     count_parameters(pipe.transformer)
 
     samples_dir = Path("output") / "samples"
-    generate_images(pipe, prompt, samples_dir / f"bf16_{low_rank_method}", seed=42)
-    print(f"Samples saved to '{samples_dir / f'bf16_{low_rank_method}'}'")
+    generate_images(pipe, prompt, samples_dir / f"bf16", seed=42)
+    print(f"Samples saved to '{samples_dir / f'bf16'}'")
 
     pipe.transformer.to("cpu")
     del pipe.transformer
@@ -500,17 +250,54 @@ def main(prompt, low_rank_method="add_after_quant"):
                 w_bits=w_bits,
                 use_low_rank=low_rank != 0,
                 low_rank_dim=low_rank,
-                low_rank_method=low_rank_method,
             )
             count_parameters(pipe.transformer)
             generate_images(
                 pipe,
                 prompt,
-                samples_dir / f"w{w_bits}_{low_rank_method}" / f"rank{low_rank}",
+                samples_dir / f"w{w_bits}" / f"rank{low_rank}",
                 seed=42,
             )
             print(
-                f"Samples saved to '{samples_dir / f'w{w_bits}_{low_rank_method}' / f'rank{low_rank}'}'"
+                f"Samples saved to '{samples_dir / f'w{w_bits}' / f'rank{low_rank}'}'"
+            )
+
+            # Clean up after each iteration
+            pipe.transformer.to("cpu")
+            del pipe.transformer
+            torch.cuda.empty_cache()
+
+def test(prompt):
+    # Sanity Check Full Precision
+    model_name = "black-forest-labs/FLUX.1-dev"
+    pipe: FluxPipeline = DiffusionPipeline.from_pretrained(
+        model_name, torch_dtype=torch.bfloat16
+    ).to("cuda")
+    count_parameters(pipe.transformer)
+
+    samples_dir = Path("output") / "samples"
+    pipe.transformer.to("cpu")
+    del pipe.transformer
+    torch.cuda.empty_cache()
+
+    for w_bits in [4]:
+        for low_rank in [16, 64]:
+            # Load new model
+            pipe.transformer = load_quantized_model(
+                model_name,
+                w_bits=w_bits,
+                use_low_rank=low_rank != 0,
+                low_rank_dim=low_rank,
+            )
+            count_parameters(pipe.transformer)
+            generate_images(
+                pipe,
+                prompt,
+                samples_dir / f"w{w_bits}" / f"rank{low_rank}",
+                seed=42,
+            )
+            print(
+                f"Samples saved to '{samples_dir / f'w{w_bits}' / f'rank{low_rank}'}'"
             )
 
             # Clean up after each iteration
@@ -521,13 +308,16 @@ def main(prompt, low_rank_method="add_after_quant"):
 
 if __name__ == "__main__":
     # Test both methods
-    for method in ["add_after_quant", "subtract_before_quant"]:
-        print(f"\n=== Testing {method} method ===")
-        main(
-            prompt="Cyberpunk samurai on a neon-lit rooftop at dusk, dramatic rim lighting, 32-bit render",
-            low_rank_method=method,
-        )
-        main(
-            prompt="A fantasy landscape with mountains and a river",
-            low_rank_method=method,
-        )
+    # test(
+    #     prompt="Cyberpunk samurai on a neon-lit rooftop at dusk, dramatic rim lighting, 32-bit render",
+    # )
+    # test(
+    #     prompt="A fantasy landscape with mountains and a river",
+    # )
+
+    main(
+        prompt="Cyberpunk samurai on a neon-lit rooftop at dusk, dramatic rim lighting, 32-bit render",
+    )
+    main(
+        prompt="A fantasy landscape with mountains and a river",
+    )
