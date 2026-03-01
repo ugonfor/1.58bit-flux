@@ -32,6 +32,7 @@ import torch
 import torch.nn.functional as F
 from pathlib import Path
 from diffusers import FluxPipeline, FluxTransformer2DModel
+import lpips as lpips_lib
 
 from models.ternary import quantize_to_ternary, memory_stats
 
@@ -326,6 +327,14 @@ def parse_args():
     p.add_argument("--no-svd",             action="store_true")
     p.add_argument("--init-ckpt",          type=str,   default=None,
                    help="Path to a prior checkpoint to warm-start from (loads scale+lora weights)")
+    p.add_argument("--lpips-weight",       type=float, default=0.0,
+                   help="Weight for LPIPS perceptual loss added on top of FM MSE loss. "
+                        "Decodes student/teacher z_0 through frozen VAE and computes AlexNet "
+                        "perceptual distance. Improves aesthetic quality / sharpness. "
+                        "Recommended: 0.05-0.2. Default: 0 (disabled).")
+    p.add_argument("--lpips-freq",         type=int,   default=1,
+                   help="Compute LPIPS loss every N steps (default 1 = every step). "
+                        "Set higher to reduce compute overhead.")
     return p.parse_args()
 
 
@@ -338,6 +347,8 @@ def main():
     dtype  = torch.bfloat16
 
     ckpt_tag  = f"r{args.rank}_res{args.res}_s{args.steps}_{args.loss_type}"
+    if args.lpips_weight > 0:
+        ckpt_tag += f"_lpips{args.lpips_weight:.0e}"
     ckpt_path = OUTPUT_DIR / f"ternary_distilled_{ckpt_tag}.pt"
     eval_dir  = OUTPUT_DIR / f"eval_ternary_{ckpt_tag}"
     log_path  = OUTPUT_DIR / f"training_log_{ckpt_tag}.json"
@@ -345,6 +356,8 @@ def main():
     print(f"=== Ternary FLUX Distillation ===")
     print(f"  loss={args.loss_type}, steps={args.steps}, rank={args.rank}, res={args.res}, "
           f"grad_accum={args.grad_accum}, grad_checkpointing={args.grad_checkpointing}")
+    if args.lpips_weight > 0:
+        print(f"  LPIPS perceptual loss: weight={args.lpips_weight}, freq=every {args.lpips_freq} steps")
 
     # ------------------------------------------------------------------ #
     # 1. Load student pipeline (BF16 → ternary)
@@ -402,11 +415,24 @@ def main():
                 "text_ids":      ti.cpu(),
             })
     print(f"    Encoded {len(calib_embeds)} prompts.")
-    for attr in ("text_encoder", "text_encoder_2", "vae"):
+    # Offload text encoders always; keep VAE on GPU when LPIPS is enabled
+    for attr in ("text_encoder", "text_encoder_2"):
         m = getattr(pipe, attr, None)
         if m is not None: m.to("cpu")
+    if args.lpips_weight == 0:
+        vae_m = getattr(pipe, "vae", None)
+        if vae_m is not None: vae_m.to("cpu")
     torch.cuda.empty_cache()
     print(f"    VRAM after offload: {torch.cuda.memory_allocated()/1024**3:.1f} GB")
+
+    # LPIPS perceptual loss model (AlexNet, ~50 MB)
+    lpips_fn = None
+    if args.lpips_weight > 0:
+        print(f"\n[2c] Loading LPIPS model (AlexNet)...")
+        lpips_fn = lpips_lib.LPIPS(net="alex").to(device)
+        lpips_fn.requires_grad_(False)
+        lpips_fn.eval()
+        print(f"    LPIPS ready. VAE kept on GPU for perceptual decode.")
 
     _lat_h = 2 * (int(args.res) // (pipe.vae_scale_factor * 2))
     _lat_w = _lat_h
@@ -477,6 +503,8 @@ def main():
 
     pipe.transformer.train()
     optimizer.zero_grad()
+    fm_loss    = torch.tensor(0.0)
+    lpips_loss = torch.tensor(0.0)
 
     for step in range(1, args.steps + 1):
         t_frac = random.uniform(0.0, 1.0)
@@ -501,7 +529,39 @@ def main():
             with torch.no_grad():
                 v_teacher = teacher(**inputs, return_dict=False)[0].float().detach()
             v_student = pipe.transformer(**inputs, return_dict=False)[0].float()
-            loss = F.mse_loss(v_student, v_teacher)
+            fm_loss = F.mse_loss(v_student, v_teacher)
+
+            # Perceptual (LPIPS) loss: decode z_0_pred and z_0 through frozen VAE
+            lpips_loss = torch.tensor(0.0, device=device)
+            # Only apply LPIPS when t_frac < 0.8: at high noise levels z_0_pred is too
+            # inaccurate to provide a stable perceptual supervision signal.
+            if lpips_fn is not None and step % args.lpips_freq == 0 and t_frac < 0.8:
+                # Reconstruct z_0 prediction from student velocity
+                # FM: z_t = (1-t)*z_0 + t*eps  →  z_0 = z_t - t*v
+                z_0_pred = z_t.float() - t_frac * v_student  # [1, seq, 64], float32
+                # Unpack packed FLUX latents → spatial [1, C, H, W]
+                _vae_sf = pipe.vae_scale_factor
+                z_0_pred_sp = FluxPipeline._unpack_latents(
+                    z_0_pred.to(dtype), args.res, args.res, _vae_sf)           # bfloat16
+                z_0_pred_sp = (z_0_pred_sp / pipe.vae.config.scaling_factor
+                               + pipe.vae.config.shift_factor)
+                img_student = pipe.vae.decode(z_0_pred_sp).sample.float()      # [1,3,H,W]
+                img_student = img_student.clamp(-1.0, 1.0)
+                # Downsample to 256px for LPIPS (saves memory; perceptual features don't need full res)
+                img_student_sm = F.interpolate(img_student, size=256,
+                                               mode="bilinear", align_corners=False)
+                with torch.no_grad():
+                    z_0_ref_sp = FluxPipeline._unpack_latents(
+                        z_0.to(dtype), args.res, args.res, _vae_sf)
+                    z_0_ref_sp = (z_0_ref_sp / pipe.vae.config.scaling_factor
+                                  + pipe.vae.config.shift_factor)
+                    img_teacher_dec = pipe.vae.decode(z_0_ref_sp).sample.float()
+                    img_teacher_sm  = F.interpolate(
+                        img_teacher_dec.clamp(-1.0, 1.0), size=256,
+                        mode="bilinear", align_corners=False)
+                lpips_loss = lpips_fn(img_student_sm, img_teacher_sm).mean()
+
+            loss = fm_loss + args.lpips_weight * lpips_loss
 
         elif args.loss_type == "online":
             # ---- Online FM: pseudo-z_0 via single-step teacher Euler denoising ----
@@ -601,23 +661,32 @@ def main():
 
         if step % 10 == 0:
             elapsed = time.time() - t0
-            lr_s = optimizer.param_groups[0]["lr"]
             lr_l = optimizer.param_groups[1]["lr"]
-            print(f"  step {step:4d}/{args.steps} | loss={loss.item():.5f} "
-                  f"| lr={lr_l:.2e} | {elapsed:.0f}s elapsed")
-            log.append({"step": step, "loss": loss.item()})
+            lpips_str = (f" | lpips={lpips_loss.item():.4f}" if lpips_fn is not None else "")
+            fm_str    = (f" | fm={fm_loss.item():.5f}" if lpips_fn is not None else "")
+            print(f"  step {step:4d}/{args.steps} | loss={loss.item():.5f}"
+                  f"{fm_str}{lpips_str}"
+                  f" | lr={lr_l:.2e} | {elapsed:.0f}s elapsed")
+            log.append({"step": step, "loss": loss.item(),
+                        "fm_loss": fm_loss.item() if args.loss_type == "fm" else None,
+                        "lpips_loss": lpips_loss.item() if lpips_fn is not None else None})
             sys.stdout.flush()
 
         if step % args.eval_every == 0 or step == args.steps:
             print(f"\n  [eval] step {step}...")
             pipe.transformer.eval()
+            # Text encoders always need to come to GPU for inference; VAE may already be there
             for attr in ("text_encoder", "text_encoder_2", "vae"):
                 m = getattr(pipe, attr, None)
                 if m is not None: m.to(device)
             eval_images(pipe, step, eval_dir)
-            for attr in ("text_encoder", "text_encoder_2", "vae"):
+            # After eval: offload text encoders. Only offload VAE if LPIPS is not using it.
+            for attr in ("text_encoder", "text_encoder_2"):
                 m = getattr(pipe, attr, None)
                 if m is not None: m.to("cpu")
+            if args.lpips_weight == 0:
+                vae_m = getattr(pipe, "vae", None)
+                if vae_m is not None: vae_m.to("cpu")
             torch.cuda.empty_cache()
             pipe.transformer.train()
             print(f"  [eval] → {eval_dir}/step{step:04d}_p*.png")
