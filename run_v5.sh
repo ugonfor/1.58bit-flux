@@ -15,10 +15,17 @@ $PYTHON merge_datasets.py \
   --out output/teacher_dataset_combined.pt
 
 echo ""
-echo "Step 2: Backup V2 checkpoint"
+echo "Step 2: Backup V2 checkpoint and eval directory"
 cp output/ternary_distilled_r64_res1024_s3000_fm.pt \
    output/ternary_distilled_r64_res1024_s3000_fm_v2_backup.pt
-echo "  Backed up V2 → ...fm_v2_backup.pt"
+echo "  Backed up V2 checkpoint → ...fm_v2_backup.pt"
+
+# Rename V2 mid-training eval dir so V5 doesn't overwrite it
+if [ -d output/eval_ternary_r64_res1024_s3000_fm ]; then
+  mv output/eval_ternary_r64_res1024_s3000_fm \
+     output/eval_ternary_r64_res1024_s3000_fm_v2_backup
+  echo "  Renamed V2 eval dir → ...fm_v2_backup/"
+fi
 
 echo ""
 echo "Step 3: V5 offline FM training (548 images, 174 prompts, warm-start from V2)"
