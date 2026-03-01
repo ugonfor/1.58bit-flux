@@ -124,23 +124,59 @@ python train_ternary.py \
 
 ### Loss Curve (V5 vs V2)
 
-| Steps | V5 avg loss | V2 avg loss |
-|---|---|---|
-| TBD | TBD | 0.073 at step 20 |
+Warm-start from V2 gives 30× faster initial convergence:
+
+| Step | V5 loss | V2 loss | Notes |
+|---|---|---|---|
+| 10 | 0.069 | 2.124 | V5 warm-start vs V2 cold-start (30× lower!) |
+| 20 | 0.239 | 0.073 | FM high variance — random t sampling |
+| 500 | 0.035 | — | V5 LR=9.3e-5 |
+| 1000 | 0.054 | — | V5 LR=7.5e-5 |
+| 1500 | 0.047 | — | V5 LR=5.1e-5 |
+| 2000 | 0.094 | — | V5 LR=2.6e-5 |
+| 2500 | — | — | V5 LR=~7e-6 |
+| 3000 | ~0.065 | 0.108 | Final; Total time: 135.4 min |
+
+V5 loss range throughout: 0.02–0.36 (FM high variance due to random t sampling).
+V2 final avg loss: ~0.08–0.12 at step 3000.
 
 ### CLIP Scores (step 3000, 30 inference steps, seed=42)
 
-| Prompt | V5 CLIP | % of BF16 | V2 score |
-|---|---|---|---|
-| Cyberpunk samurai on a neon-lit rooftop | TBD | TBD | 0.3312 (102.9%) |
-| A fantasy landscape with mountains and a river | TBD | TBD | 0.3266 (101.4%) |
-| Portrait of a young woman with wild curly hair | TBD | TBD | 0.3543 (110.0%) |
-| Aerial view of a coastal city at sunset | TBD | TBD | 0.2778 (86.3%) |
-| **Average** | **TBD** | **TBD** | **0.3225** |
+| Prompt | V5 CLIP | % of BF16 | V2 score | Δ vs V2 |
+|---|---|---|---|---|
+| Cyberpunk samurai on a neon-lit rooftop | **0.3328** | 103.4% | 0.3312 (102.9%) | +0.5% |
+| A fantasy landscape with mountains and a river | **0.3288** | 102.1% | 0.3266 (101.4%) | +0.7% |
+| Portrait of a young woman with wild curly hair | **0.3436** | 106.7% | 0.3543 (110.0%) | -3.0% |
+| Aerial view of a coastal city at sunset | **0.3082** | 95.7% | 0.2778 (86.3%) | **+10.9%** |
+| **Average** | **0.3283** | **101.9%** | **0.3225** | **+1.8%** |
 
-### Visual Comparison (BF16 vs V5, seed=42)
+V5 exceeds BF16 CLIP on average (101.9% vs 100%). The biggest gain is p3 (aerial city):
+86.3% → 95.7% (+10.9%), the previously worst-performing prompt. The portrait (p2) dropped 3%
+but remains 6.7% above BF16.
 
-*(Images to be added)*
+### Visual Comparison: V5 Training Progression (p0 = cyberpunk samurai, seed=42)
+
+| Model | Description |
+|---|---|
+| BF16 | Fully armored Japanese samurai, glowing eyes, two swords, neon city panorama backdrop |
+| V2 | Dark hooded figure hunched over in alley — **wrong subject** |
+| V5 step 500 | Armored warrior walking cyberpunk street with red sky — **correct subject!** |
+| V5 step 1000 | Armored figure on rain-soaked neon street, more dramatic |
+| V5 step 1500 | Silhouetted armored figure on rooftop with neon halo — cinematic |
+| V5 step 3000 | Silhouetted cyberpunk warrior kneeling in street, comet in red sky — cinematic |
+
+The V2 → V5 faithfulness fix happens at step 500. With 6 BF16 training examples of the cyberpunk
+samurai prompt (vs ~4 in V2) and 174 diverse prompts improving text conditioning, the student's
+velocity field now correctly maps the "cyberpunk samurai" text embedding to armored-warrior outputs.
+
+### All 4 Prompts at Step 1500
+
+| Prompt | V5 quality | Subject correct? |
+|---|---|---|
+| Cyberpunk samurai | Armored robotic silhouette on neon rooftop | ✓ (vs V2's dark hooded figure) |
+| Fantasy landscape | Alpine valley with river, dramatic clouds | ✓ |
+| Portrait curly hair | Woman with curly hair in warm golden light | ✓ |
+| Aerial coastal city | European river city at sunset | Partial (city ✓, aerial perspective missing) |
 
 ---
 
@@ -190,7 +226,7 @@ Both metrics matter. CLIP ≈ BF16 is necessary but not sufficient for "awesome 
 | FM distilled V2 (200 imgs, warm-start) | 0.3225 | Post-004, matches BF16 |
 | Online FM V3 (3e-5 LR) | — | Failed (creature artifacts) |
 | Online FM V4 (1e-4 LR) | — | Failed (grid artifacts) |
-| **FM distilled V5 (548 imgs, 174 prompts)** | **TBD** | **This post** |
+| **FM distilled V5 (548 imgs, 174 prompts)** | **0.3283** | **This post; exceeds BF16 (101.9%)** |
 
 GPU: NVIDIA A100-SXM4-80GB
 Python env: diffusers==0.34.0, torch==2.5.0+cu124
