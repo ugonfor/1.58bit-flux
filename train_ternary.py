@@ -2,12 +2,19 @@
 Self-supervised distillation: BF16 FLUX → Ternary FLUX.
 Reproduces: https://chenglin-yang.github.io/1.58bit.flux.github.io/
 
-Three loss modes:
+Four loss modes:
 
-  fm (DEFAULT, correct): Proper flow-matching distillation.
+  online (BEST): Online flow-matching distillation. No pre-generated dataset needed.
+    Each step: sample random Gaussian z_rand, run teacher 1-step to get pseudo-z_0,
+    then FM-train on that trajectory. Infinite diversity → no memorization.
+    z_0_pseudo = z_rand - t_large * teacher(z_rand, t_large, c)  [single Euler step]
+    z_t = (1-t)*z_0_pseudo + t*eps, loss = MSE(student(z_t,t,c), teacher(z_t,t,c))
+    Usage: python train_ternary.py --loss-type online
+
+  fm: Proper flow-matching distillation with pre-generated teacher latents.
     1. Pre-generate teacher latents: python generate_teacher_dataset.py
     2. Train: z_t = (1-t)*z_0 + t*eps, loss = MSE(student(z_t,t,c), teacher(z_t,t,c))
-    This ensures training distribution matches inference distribution.
+    Limited by dataset size — model may memorize fixed trajectories.
     Usage: python train_ternary.py --loss-type fm --dataset output/teacher_dataset.pt
 
   output (baseline, wrong distribution): Teacher/student velocity MSE at random noise z_t.
@@ -178,8 +185,10 @@ def parse_args():
     p.add_argument("--eval-every", type=int,   default=500)
     p.add_argument("--res",        type=int,   default=1024)
     p.add_argument("--loss-type",  type=str,   default="fm",
-                   choices=["fm", "output", "layer"],
-                   help=("fm (default): proper flow-matching with pre-generated teacher latents. "
+                   choices=["fm", "online", "output", "layer"],
+                   help=("online (best): FM distillation with on-the-fly pseudo-z_0 via single-step "
+                         "teacher denoising. Infinite diversity, no memorization. No dataset needed. "
+                         "fm: proper FM distillation with pre-generated teacher latents (limited by dataset). "
                          "output: velocity MSE at random noise (wrong distribution, baseline). "
                          "layer: intermediate activation MSE (legacy)."))
     p.add_argument("--dataset",    type=str,   default="output/teacher_dataset.pt",
@@ -279,6 +288,10 @@ def main():
     # ------------------------------------------------------------------ #
     # 3. Load teacher dataset (fm mode) or hooks (layer mode)
     # ------------------------------------------------------------------ #
+    # img_ids are the same for all samples at a given resolution
+    _img_ids = FluxPipeline._prepare_latent_image_ids(
+        1, _lat_h // 2, _lat_w // 2, device, dtype)
+
     fm_dataset = None
     if args.loss_type == "fm":
         print(f"\n[3] Loading teacher dataset: {args.dataset}")
@@ -287,22 +300,23 @@ def main():
               f"Latent shape: {fm_dataset[0]['latent_z0'].shape}")
         print(f"    Flow-matching training: z_t = (1-t)*z_0 + t*eps, "
               f"target = teacher_velocity(z_t, t)")
-        # Compute img_ids once (same for all samples at this resolution)
-        _img_ids = FluxPipeline._prepare_latent_image_ids(
-            1, _lat_h // 2, _lat_w // 2, device, dtype)
         teacher_cache = student_cache = None
+
+    elif args.loss_type == "online":
+        teacher_cache = student_cache = None
+        print(f"\n[3] Online FM distillation: pseudo-z_0 via single-step teacher denoising.")
+        print(f"    Each step: z_rand~N(0,I) → teacher 1-step Euler → z_0_pseudo → FM trajectory")
+        print(f"    Infinite diversity, no dataset memorization. Using {len(calib_embeds)} prompts.")
 
     elif args.loss_type == "layer":
         teacher_cache = ActivationCache().register(teacher, double_every=1, single_every=4)
         student_cache = ActivationCache().register(pipe.transformer, double_every=1, single_every=4)
         print(f"\n[3] Layer hooks: {len(teacher_cache._hooks)} teacher "
               f"+ {len(student_cache._hooks)} student")
-        _img_ids = None
 
     else:  # output (random-noise baseline)
         teacher_cache = student_cache = None
         print(f"\n[3] Output-velocity loss at random noise (distribution-shifted baseline).")
-        _img_ids = None
 
     # ------------------------------------------------------------------ #
     # 4. Optimizer
@@ -361,13 +375,58 @@ def main():
             v_student = pipe.transformer(**inputs, return_dict=False)[0].float()
             loss = F.mse_loss(v_student, v_teacher)
 
+        elif args.loss_type == "online":
+            # ---- Online FM: pseudo-z_0 via single-step teacher Euler denoising ----
+            # Reference: EfficientDM (ICLR 2024) + flow-matching adaptation
+            emb = random.choice(calib_embeds)
+            pe  = emb["prompt_embeds"].to(device=device, dtype=dtype)
+            poe = emb["pooled_embeds"].to(device=device, dtype=dtype)
+            ti  = emb["text_ids"].to(device=device, dtype=dtype)
+
+            # Step 1: sample random Gaussian at a large timestep
+            t_large = random.uniform(0.7, 0.95)
+            raw_rand = torch.randn(1, _num_ch, _lat_h, _lat_w, device=device, dtype=dtype)
+            z_rand = FluxPipeline._pack_latents(raw_rand, 1, _num_ch, _lat_h, _lat_w)
+
+            # Step 2: teacher single-step Euler → pseudo-z_0
+            # z_0_pseudo = z_rand - t_large * v_teacher(z_rand, t_large, c)
+            with torch.no_grad():
+                v_rough = teacher(
+                    hidden_states=z_rand,
+                    timestep=torch.tensor([t_large], device=device, dtype=dtype),
+                    guidance=torch.tensor([3.5],     device=device, dtype=dtype),
+                    encoder_hidden_states=pe,
+                    pooled_projections=poe,
+                    txt_ids=ti,
+                    img_ids=_img_ids,
+                    return_dict=False,
+                )[0]
+            z_0_pseudo = (z_rand - t_large * v_rough).detach()
+
+            # Step 3: FM trajectory from pseudo-z_0
+            eps = torch.randn_like(z_0_pseudo)
+            z_t = (1.0 - t_frac) * z_0_pseudo + t_frac * eps
+
+            # Step 4: teacher and student velocity at z_t
+            inputs = {
+                "hidden_states":         z_t,
+                "timestep":              torch.tensor([t_frac], device=device, dtype=dtype),
+                "guidance":              torch.tensor([3.5],   device=device, dtype=dtype),
+                "encoder_hidden_states": pe,
+                "pooled_projections":    poe,
+                "txt_ids":               ti,
+                "img_ids":               _img_ids,
+            }
+            with torch.no_grad():
+                v_teacher = teacher(**inputs, return_dict=False)[0].float().detach()
+            v_student = pipe.transformer(**inputs, return_dict=False)[0].float()
+            loss = F.mse_loss(v_student, v_teacher)
+
         elif args.loss_type == "output":
             # ---- Random-noise baseline (wrong distribution, for comparison) ----
             emb = random.choice(calib_embeds)
             raw = torch.randn(1, _num_ch, _lat_h, _lat_w, device=device, dtype=dtype)
             latents = FluxPipeline._pack_latents(raw, 1, _num_ch, _lat_h, _lat_w)
-            img_ids = FluxPipeline._prepare_latent_image_ids(
-                1, _lat_h // 2, _lat_w // 2, device, dtype)
             inputs = {
                 "hidden_states":         latents,
                 "timestep":              torch.tensor([t_frac], device=device, dtype=dtype),
@@ -375,7 +434,7 @@ def main():
                 "encoder_hidden_states": emb["prompt_embeds"].to(device=device, dtype=dtype),
                 "pooled_projections":    emb["pooled_embeds"].to(device=device, dtype=dtype),
                 "txt_ids":               emb["text_ids"].to(device=device, dtype=dtype),
-                "img_ids":               img_ids,
+                "img_ids":               _img_ids,
             }
             with torch.no_grad():
                 v_teacher = teacher(**inputs, return_dict=False)[0].float().detach()
@@ -386,8 +445,6 @@ def main():
             emb = random.choice(calib_embeds)
             raw = torch.randn(1, _num_ch, _lat_h, _lat_w, device=device, dtype=dtype)
             latents = FluxPipeline._pack_latents(raw, 1, _num_ch, _lat_h, _lat_w)
-            img_ids = FluxPipeline._prepare_latent_image_ids(
-                1, _lat_h // 2, _lat_w // 2, device, dtype)
             inputs = {
                 "hidden_states":         latents,
                 "timestep":              torch.tensor([t_frac], device=device, dtype=dtype),
@@ -395,7 +452,7 @@ def main():
                 "encoder_hidden_states": emb["prompt_embeds"].to(device=device, dtype=dtype),
                 "pooled_projections":    emb["pooled_embeds"].to(device=device, dtype=dtype),
                 "txt_ids":               emb["text_ids"].to(device=device, dtype=dtype),
-                "img_ids":               img_ids,
+                "img_ids":               _img_ids,
             }
             teacher_cache.clear()
             with torch.no_grad():
