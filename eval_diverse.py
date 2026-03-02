@@ -206,19 +206,28 @@ def main():
 
     bf16_dir = OUTPUT_DIR / "eval_diverse_bf16"
 
+    def _all_images_exist(d: Path) -> bool:
+        return all((d / f"p{i:02d}.png").exists() for i in range(len(DIVERSE_PROMPTS)))
+
     # ------------------------------------------------------------------ #
     # 1. Generate BF16 reference images
     # ------------------------------------------------------------------ #
     if not args.skip_gen:
         print("=== [1/3] BF16 reference generation ===")
-        pipe_bf16 = FluxPipeline.from_pretrained(
-            MODEL_NAME, torch_dtype=torch.bfloat16, local_files_only=True).to(device)
-        generate_images(pipe_bf16, DIVERSE_PROMPTS, bf16_dir,
-                        args.steps, args.seed, "BF16")
-        del pipe_bf16; torch.cuda.empty_cache()
+        if _all_images_exist(bf16_dir):
+            print(f"  All BF16 images already exist in {bf16_dir}, skipping pipe load.")
+        else:
+            pipe_bf16 = FluxPipeline.from_pretrained(
+                MODEL_NAME, torch_dtype=torch.bfloat16, local_files_only=True).to(device)
+            generate_images(pipe_bf16, DIVERSE_PROMPTS, bf16_dir,
+                            args.steps, args.seed, "BF16")
+            del pipe_bf16; torch.cuda.empty_cache()
 
         for label, ckpt_path in student_models:
             img_dir = OUTPUT_DIR / f"eval_diverse_{label.lower()}"
+            if _all_images_exist(img_dir):
+                print(f"\n  All {label} images already exist in {img_dir}, skipping pipe load.")
+                continue
             print(f"\n=== [1/3] {label} generation ===")
             pipe_s = load_student_pipe(ckpt_path, args.rank, device)
             generate_images(pipe_s, DIVERSE_PROMPTS, img_dir,
