@@ -498,8 +498,9 @@ def main():
 
     elif args.loss_type == "online":
         teacher_cache = student_cache = None
-        print(f"\n[3] Online FM distillation: pseudo-z_0 via single-step teacher denoising.")
-        print(f"    Each step: z_rand~N(0,I) → teacher 1-step Euler → z_0_pseudo → FM trajectory")
+        _n_step_label = f"{args.online_steps}-step" if args.online_steps > 1 else "single-step"
+        print(f"\n[3] Online FM distillation: pseudo-z_0 via {_n_step_label} teacher denoising.")
+        print(f"    Each step: z_rand~N(0,I) → teacher {args.online_steps}-step Euler → z_0_pseudo → FM trajectory")
         print(f"    Infinite diversity, no dataset memorization. Using {len(calib_embeds)} prompts.")
 
     elif args.loss_type == "layer":
