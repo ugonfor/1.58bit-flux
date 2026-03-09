@@ -370,7 +370,7 @@ def main():
     n_cols       = 1 + len(student_models)   # BF16 + students
     sample_idx   = [0, 3, 6, 9, 12, 15, 17, 19]
     all_dirs     = [("BF16", bf16_dir)] + [
-        (lb, OUTPUT_DIR / f"eval_diverse_{lb.lower()}") for lb, _ in student_models]
+        (lb, OUTPUT_DIR / f"eval_diverse_{lb.lower()}") for lb, *_ in student_models]
     grid_rows    = []
 
     for i in sample_idx:
