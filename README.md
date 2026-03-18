@@ -1,2 +1,3 @@
-# DiT-bits-vs-quality
-Visualizing quality drop in diffusion transformers under varying quantization bits.
+# 1.58bit-flux
+
+let's reproduce 1.58bit-flux(https://chenglin-yang.github.io/1.58bit.flux.github.io/) with autoresearch.
